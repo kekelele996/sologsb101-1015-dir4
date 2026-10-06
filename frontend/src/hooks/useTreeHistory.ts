@@ -7,12 +7,13 @@ import { computed, onScopeDispose, ref, type ComputedRef, type Ref } from 'vue'
 import { liveQuery } from 'dexie'
 import type { Survey } from '../types/survey'
 import type { Measure } from '../types/measure'
-import type { Support } from '../types/support'
+import type { Support, SupportCheck } from '../types/support'
 import type { Review } from '../types/review'
 import { db, initDatabase } from '../utils/db'
+import { latestSupportCheck } from '../utils/dimension'
 
 /** 时间线条目类型 */
-export type HistoryKind = 'survey' | 'measure' | 'support' | 'review'
+export type HistoryKind = 'survey' | 'measure' | 'support' | 'supportCheck' | 'review'
 
 export interface HistoryItem {
   key: string
@@ -28,6 +29,7 @@ export const HISTORY_KIND_LABEL: Record<HistoryKind, string> = {
   survey: '树体检查',
   measure: '复壮措施',
   support: '加固件',
+  supportCheck: '加固检查',
   review: '长势复评',
 }
 
@@ -36,7 +38,8 @@ export function buildHistory(
   surveys: Survey[],
   measures: Measure[],
   supports: Support[],
-  reviews: Review[]
+  reviews: Review[],
+  supportChecks: SupportCheck[] = []
 ): HistoryItem[] {
   const items: HistoryItem[] = []
   surveys.forEach((row) => {
@@ -60,13 +63,29 @@ export function buildHistory(
     })
   })
   supports.forEach((row) => {
+    const checks = supportChecks
+      .filter((check) => check.supportId === row.id)
+      .sort((a, b) => a.date.localeCompare(b.date) || a.createdAt.localeCompare(b.createdAt))
+    const latest = latestSupportCheck(checks)
     items.push({
       key: `support-${row.id}`,
       kind: 'support',
       date: row.installDate,
       title: `加固件 · ${row.type}`,
-      detail: `安装于 ${row.installDate}，检查周期 ${row.checkCycleMon} 个月，最近检查 ${row.lastCheckDate || '未记录'}`,
+      detail: `安装于 ${row.installDate}，检查周期 ${row.checkCycleMon} 个月，累计检查 ${checks.length} 次，最近检查 ${
+        latest === null ? '未记录' : `${latest.date}（${latest.inspector || '检查人未记录'}）`
+      }`,
       badge: row.type,
+    })
+    checks.forEach((check) => {
+      items.push({
+        key: `supportcheck-${check.id}`,
+        kind: 'supportCheck',
+        date: check.date,
+        title: `${row.type}检查 · ${check.inspector || '检查人未记录'}`,
+        detail: check.conclusion || '未填写检查结论',
+        badge: check.conclusion === '' ? '未填结论' : '已检查',
+      })
     })
   })
   reviews.forEach((row) => {
@@ -99,6 +118,7 @@ export function useTreeHistory(treeId: Ref<string | null> | string | null): UseT
   const surveys = ref<Survey[]>([])
   const measures = ref<Measure[]>([])
   const supports = ref<Support[]>([])
+  const supportChecks = ref<SupportCheck[]>([])
   const reviews = ref<Review[]>([])
   const loading = ref(true)
   const error = ref('')
@@ -106,18 +126,20 @@ export function useTreeHistory(treeId: Ref<string | null> | string | null): UseT
   void initDatabase()
   const subscription = liveQuery(async () => {
     await initDatabase()
-    const [surveyRows, measureRows, supportRows, reviewRows] = await Promise.all([
+    const [surveyRows, measureRows, supportRows, supportCheckRows, reviewRows] = await Promise.all([
       db.surveys.toArray(),
       db.measures.toArray(),
       db.supports.toArray(),
+      db.supportChecks.toArray(),
       db.reviews.toArray(),
     ])
-    return { surveyRows, measureRows, supportRows, reviewRows }
+    return { surveyRows, measureRows, supportRows, supportCheckRows, reviewRows }
   }).subscribe({
-    next: ({ surveyRows, measureRows, supportRows, reviewRows }) => {
+    next: ({ surveyRows, measureRows, supportRows, supportCheckRows, reviewRows }) => {
       surveys.value = surveyRows
       measures.value = measureRows
       supports.value = supportRows
+      supportChecks.value = supportCheckRows
       reviews.value = reviewRows
       loading.value = false
       error.value = ''
@@ -139,7 +161,11 @@ export function useTreeHistory(treeId: Ref<string | null> | string | null): UseT
       surveys.value.filter((row) => row.treeId === id),
       measures.value.filter((row) => row.treeId === id),
       supports.value.filter((row) => row.treeId === id),
-      reviews.value.filter((row) => row.treeId === id)
+      reviews.value.filter((row) => row.treeId === id),
+      supportChecks.value.filter((row) => {
+        const support = supports.value.find((item) => item.id === row.supportId)
+        return support !== undefined && support.treeId === id
+      })
     )
   })
 

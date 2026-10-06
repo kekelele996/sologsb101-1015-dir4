@@ -6,6 +6,7 @@
  * - 加固件检查周期超期判定
  */
 import type { Vigor } from '../types/review'
+import type { SupportCheck } from '../types/support'
 import { today } from './id'
 
 /** 厘米 → 米（保留 3 位小数） */
@@ -101,7 +102,7 @@ export function worseVigor(a: Vigor, b: Vigor): Vigor {
 
 /**
  * 加固件是否超期未检查。
- * 依据 installDate / lastCheckDate 加上 checkCycleMon 个月，与今天比较。
+ * 以最新一条检查记录的日期加上 checkCycleMon 个月与今天比较；没有任何检查记录时视为未检查（超期）。
  */
 export function isSupportOverdue(lastCheckDate: string, checkCycleMon: number, reference = today()): boolean {
   const base = lastCheckDate === '' ? '' : lastCheckDate
@@ -121,6 +122,24 @@ export function overdueDays(lastCheckDate: string, checkCycleMon: number, refere
   const next = nextCheckDate(lastCheckDate, checkCycleMon)
   if (next === '') return 0
   return Math.max(0, daysBetween(next, reference))
+}
+
+/**
+ * 把某件加固件的检查记录按时间先后排序：
+ * 先按检查日期升序；同一天补记的两条，按录入时间（createdAt）升序，后录入的排在后面。
+ */
+export function sortSupportChecks<T extends Pick<SupportCheck, 'date' | 'createdAt'>>(checks: T[]): T[] {
+  return [...checks].sort(
+    (a, b) => a.date.localeCompare(b.date) || a.createdAt.localeCompare(b.createdAt),
+  )
+}
+
+/**
+ * 取最新一条检查记录：检查日期最晚；同一天补记两条的按后录入（createdAt 更大）的那条算。
+ */
+export function latestSupportCheck<T extends Pick<SupportCheck, 'date' | 'createdAt'>>(checks: T[]): T | null {
+  if (checks.length === 0) return null
+  return sortSupportChecks(checks)[checks.length - 1]
 }
 
 /** 日期加 n 个月，返回 YYYY-MM-DD */

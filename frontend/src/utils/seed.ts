@@ -7,7 +7,7 @@ import { db, ROW_REVISION } from './db'
 import type { Tree } from '../types/tree'
 import type { Survey } from '../types/survey'
 import type { Measure } from '../types/measure'
-import type { Support } from '../types/support'
+import type { Support, SupportCheck } from '../types/support'
 import type { Review } from '../types/review'
 
 const SEED_TIME = '2026-01-08T01:30:00.000Z'
@@ -92,13 +92,35 @@ export async function seedDatabase(): Promise<void> {
     wrap<Measure>({ id: 'measure-c2', treeId: SEED_IDS.treeC, type: '病虫害防治', date: '2026-05-06', material: '生物制剂 2 次施药', operator: '周敏', state: '计划' }),
   ]
 
-  // ---------------- 加固件（含超周期未检查的样本） ----------------
+  // ---------------- 加固件（超期与否由检查记录派生） ----------------
   const supports: Support[] = [
-    wrap<Support>({ id: 'support-a1', treeId: SEED_IDS.treeA, type: '支撑杆', installDate: '2019-04-08', checkCycleMon: 24, lastCheckDate: '2024-03-15' }),
-    wrap<Support>({ id: 'support-a2', treeId: SEED_IDS.treeA, type: '避雷', installDate: '2020-07-01', checkCycleMon: 24, lastCheckDate: '2025-06-01' }),
-    wrap<Support>({ id: 'support-b1', treeId: SEED_IDS.treeB, type: '拉纤', installDate: '2021-09-20', checkCycleMon: 36, lastCheckDate: '2024-08-10' }),
-    wrap<Support>({ id: 'support-c1', treeId: SEED_IDS.treeC, type: '避雷', installDate: '2018-06-01', checkCycleMon: 12, lastCheckDate: '2025-05-20' }),
-    wrap<Support>({ id: 'support-c2', treeId: SEED_IDS.treeC, type: '支撑杆', installDate: '2022-05-10', checkCycleMon: 12, lastCheckDate: '2026-05-08' }),
+    wrap<Support>({ id: 'support-a1', treeId: SEED_IDS.treeA, type: '支撑杆', installDate: '2019-04-08', checkCycleMon: 24 }),
+    wrap<Support>({ id: 'support-a2', treeId: SEED_IDS.treeA, type: '避雷', installDate: '2020-07-01', checkCycleMon: 24 }),
+    wrap<Support>({ id: 'support-b1', treeId: SEED_IDS.treeB, type: '拉纤', installDate: '2021-09-20', checkCycleMon: 36 }),
+    wrap<Support>({ id: 'support-c1', treeId: SEED_IDS.treeC, type: '避雷', installDate: '2018-06-01', checkCycleMon: 12 }),
+    wrap<Support>({ id: 'support-c2', treeId: SEED_IDS.treeC, type: '支撑杆', installDate: '2022-05-10', checkCycleMon: 12 }),
+  ]
+
+  // ---------------- 加固件检查记录（每次检查一条，含同日补记样本） ----------------
+  // support-c2 在 2026-05-08 当天补记两条，后录入的一条（王建军，结论正常）作为最新检查
+  const supportChecks: SupportCheck[] = [
+    wrap<SupportCheck>({ id: 'supportcheck-a1-1', supportId: 'support-a1', date: '2024-03-15', inspector: '王建军', conclusion: '支撑杆锈蚀轻微，紧固螺栓无松动，周期内继续观察。' }),
+    wrap<SupportCheck>({ id: 'supportcheck-a2-1', supportId: 'support-a2', date: '2023-06-01', inspector: '李慧', conclusion: '避雷带接地电阻合格，瓷瓶完好。' }),
+    wrap<SupportCheck>({ id: 'supportcheck-a2-2', supportId: 'support-a2', date: '2025-06-01', inspector: '李慧', conclusion: '接地电阻复测合格，引下线固定牢靠。' }),
+    wrap<SupportCheck>({ id: 'supportcheck-b1-1', supportId: 'support-b1', date: '2024-08-10', inspector: '赵鹏', conclusion: '拉纤张力均衡，锚点混凝土无裂缝。' }),
+    wrap<SupportCheck>({ id: 'supportcheck-c1-1', supportId: 'support-c1', date: '2025-05-20', inspector: '周敏', conclusion: '避雷装置锈蚀明显，已列入更换计划。' }),
+    wrap<SupportCheck>({ id: 'supportcheck-c2-1', supportId: 'support-c2', date: '2026-05-08', inspector: '周敏', conclusion: '支撑杆略有偏位，已现场校正并标记复测。' }),
+    {
+      ...wrap<SupportCheck>({
+        id: 'supportcheck-c2-2',
+        supportId: 'support-c2',
+        date: '2026-05-08',
+        inspector: '王建军',
+        conclusion: '当日复核：支撑牢固、焊缝正常，偏位已消除，检查结论正常。',
+      }),
+      createdAt: '2026-01-08T02:10:00.000Z',
+      updatedAt: '2026-01-08T02:10:00.000Z',
+    },
   ]
 
   // ---------------- 长势复评（衰弱 / 濒危样本均带后续措施） ----------------
@@ -112,11 +134,16 @@ export async function seedDatabase(): Promise<void> {
     wrap<Review>({ id: 'review-c3', treeId: SEED_IDS.treeC, date: '2026-07-20', vigor: '衰弱', trend: '好转', conclusion: '排水改造后积水缓解，新梢萌发量回升。', followUp: '继续按季度监测倾斜度与空洞变化，年度复壮计划中保留透气措施。' }),
   ]
 
-  await db.transaction('rw', db.trees, db.surveys, db.measures, db.supports, db.reviews, async () => {
-    await db.trees.bulkPut(trees)
-    await db.surveys.bulkPut(surveys)
-    await db.measures.bulkPut(measures)
-    await db.supports.bulkPut(supports)
-    await db.reviews.bulkPut(reviews)
-  })
+  await db.transaction(
+    'rw',
+    [db.trees, db.surveys, db.measures, db.supports, db.supportChecks, db.reviews],
+    async () => {
+      await db.trees.bulkPut(trees)
+      await db.surveys.bulkPut(surveys)
+      await db.measures.bulkPut(measures)
+      await db.supports.bulkPut(supports)
+      await db.supportChecks.bulkPut(supportChecks)
+      await db.reviews.bulkPut(reviews)
+    },
+  )
 }

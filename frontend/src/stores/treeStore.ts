@@ -9,7 +9,7 @@ import { liveQuery } from 'dexie'
 import type { ProtectLevel, Tree, TreeDraft } from '../types/tree'
 import type { Survey } from '../types/survey'
 import type { Measure } from '../types/measure'
-import type { Support } from '../types/support'
+import type { Support, SupportCheck } from '../types/support'
 import type { Review, Trend, Vigor } from '../types/review'
 import { VIGOR_NEED_FOLLOW_UP } from '../types/review'
 import {
@@ -26,6 +26,7 @@ import {
   LEAN_LEVEL_LABEL,
   annualGrowth,
   isSupportOverdue,
+  latestSupportCheck,
   leanLevel,
   type LeanLevel,
 } from '../utils/dimension'
@@ -55,7 +56,9 @@ export interface TreeStat {
   doneMeasureCount: number
   pendingMeasureCount: number
   supportCount: number
-  /** 超周期未检查的加固件数 */
+  /** 加固件累计检查次数 */
+  supportCheckCount: number
+  /** 超周期未检查的加固件数（以每件加固件最新一条检查记录为准） */
   overdueCount: number
   reviewCount: number
   latestVigor: Vigor | null
@@ -95,6 +98,7 @@ const EMPTY_STAT: Omit<TreeStat, 'treeId'> = {
   doneMeasureCount: 0,
   pendingMeasureCount: 0,
   supportCount: 0,
+  supportCheckCount: 0,
   overdueCount: 0,
   reviewCount: 0,
   latestVigor: null,
@@ -109,6 +113,7 @@ export const useTreeStore = defineStore('tree', () => {
   const surveys = ref<Survey[]>([])
   const measures = ref<Measure[]>([])
   const supports = ref<Support[]>([])
+  const supportChecks = ref<SupportCheck[]>([])
   const reviews = ref<Review[]>([])
   const loading = ref(true)
   const ready = ref(false)
@@ -132,6 +137,8 @@ export const useTreeStore = defineStore('tree', () => {
       const previous = treeSurveys.length > 1 ? treeSurveys[treeSurveys.length - 2] : null
       const treeMeasures = measures.value.filter((row) => row.treeId === tree.id)
       const treeSupports = supports.value.filter((row) => row.treeId === tree.id)
+      const treeSupportIds = new Set(treeSupports.map((row) => row.id))
+      const treeSupportChecks = supportChecks.value.filter((row) => treeSupportIds.has(row.supportId))
       const treeReviews = reviews.value
         .filter((row) => row.treeId === tree.id)
         .sort((a, b) => a.date.localeCompare(b.date))
@@ -156,7 +163,13 @@ export const useTreeStore = defineStore('tree', () => {
         doneMeasureCount: treeMeasures.filter((row) => row.state === '已完成').length,
         pendingMeasureCount: treeMeasures.filter((row) => row.state !== '已完成').length,
         supportCount: treeSupports.length,
-        overdueCount: treeSupports.filter((row) => isSupportOverdue(row.lastCheckDate, row.checkCycleMon)).length,
+        supportCheckCount: treeSupportChecks.length,
+        overdueCount: treeSupports.filter((row) => {
+          const latestCheck = latestSupportCheck(
+            treeSupportChecks.filter((check) => check.supportId === row.id),
+          )
+          return isSupportOverdue(latestCheck === null ? '' : latestCheck.date, row.checkCycleMon)
+        }).length,
         reviewCount: treeReviews.length,
         latestVigor: latestReview === null ? null : latestReview.vigor,
         latestTrend: latestReview === null ? null : latestReview.trend,
@@ -186,7 +199,12 @@ export const useTreeStore = defineStore('tree', () => {
   )
 
   const overdueSupports = computed<Support[]>(() =>
-    supports.value.filter((row) => isSupportOverdue(row.lastCheckDate, row.checkCycleMon))
+    supports.value.filter((row) => {
+      const latestCheck = latestSupportCheck(
+        supportChecks.value.filter((check) => check.supportId === row.id),
+      )
+      return isSupportOverdue(latestCheck === null ? '' : latestCheck.date, row.checkCycleMon)
+    }),
   )
 
   function statOf(treeId: string): TreeStat {
@@ -201,21 +219,24 @@ export const useTreeStore = defineStore('tree', () => {
       if (!subscribed) {
         subscribed = true
         liveQuery(async () => {
-          const [treeRows, surveyRows, measureRows, supportRows, reviewRows] = await Promise.all([
-            db.trees.toArray(),
-            db.surveys.toArray(),
-            db.measures.toArray(),
-            db.supports.toArray(),
-            db.reviews.toArray(),
-          ])
-          return { treeRows, surveyRows, measureRows, supportRows, reviewRows }
+          const [treeRows, surveyRows, measureRows, supportRows, supportCheckRows, reviewRows] =
+            await Promise.all([
+              db.trees.toArray(),
+              db.surveys.toArray(),
+              db.measures.toArray(),
+              db.supports.toArray(),
+              db.supportChecks.toArray(),
+              db.reviews.toArray(),
+            ])
+          return { treeRows, surveyRows, measureRows, supportRows, supportCheckRows, reviewRows }
         }).subscribe({
-          next: ({ treeRows, surveyRows, measureRows, supportRows, reviewRows }) => {
+          next: ({ treeRows, surveyRows, measureRows, supportRows, supportCheckRows, reviewRows }) => {
             const sorted = [...treeRows].sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
             trees.value = sorted
             surveys.value = surveyRows
             measures.value = measureRows
             supports.value = supportRows
+            supportChecks.value = supportCheckRows
             reviews.value = reviewRows
             loading.value = false
             ready.value = true
@@ -304,6 +325,7 @@ export const useTreeStore = defineStore('tree', () => {
     surveys,
     measures,
     supports,
+    supportChecks,
     reviews,
     loading,
     ready,

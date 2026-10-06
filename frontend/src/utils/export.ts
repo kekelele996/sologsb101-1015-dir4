@@ -7,10 +7,10 @@ import { DB_NAME, DB_SCHEMA_VERSION } from './db'
 import type { Tree } from '../types/tree'
 import type { Survey } from '../types/survey'
 import type { Measure } from '../types/measure'
-import type { Support } from '../types/support'
+import type { Support, SupportCheck } from '../types/support'
 import type { Review } from '../types/review'
 import { stampSuffix } from './id'
-import { isSupportOverdue, overdueDays } from './dimension'
+import { isSupportOverdue, latestSupportCheck, nextCheckDate, overdueDays } from './dimension'
 
 /** 触发浏览器下载 */
 export function download(filename: string, content: string, mime: string): void {
@@ -66,6 +66,7 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       snapshot: null,
     }
   }
+  // supportChecks 为 v3 新增集合，旧版存档允许缺失（导入时由遗留的 lastCheckDate 合成）
   const collections: Array<keyof DatabaseSnapshot> = ['trees', 'surveys', 'measures', 'supports', 'reviews']
   for (const key of collections) {
     if (!Array.isArray(data[key])) {
@@ -82,6 +83,7 @@ export function buildTreeCsv(
   measures: Measure[],
   supports: Support[],
   reviews: Review[],
+  supportChecks: SupportCheck[] = [],
 ): string {
   const header = [
     '编号',
@@ -102,6 +104,8 @@ export function buildTreeCsv(
     '已完成措施',
     '最近复壮日期',
     '加固件数',
+    '加固件检查次数',
+    '加固件最近检查',
     '超期未检查',
     '复评次数',
     '最新长势',
@@ -113,9 +117,24 @@ export function buildTreeCsv(
     const latest = treeSurveys.length > 0 ? treeSurveys[treeSurveys.length - 1] : null
     const treeMeasures = measures.filter((row) => row.treeId === tree.id)
     const treeSupports = supports.filter((row) => row.treeId === tree.id)
+    const treeSupportIds = new Set(treeSupports.map((row) => row.id))
+    const treeSupportChecks = supportChecks.filter((row) => treeSupportIds.has(row.supportId))
     const treeReviews = reviews.filter((row) => row.treeId === tree.id).sort((a, b) => a.date.localeCompare(b.date))
     const latestReview = treeReviews.length > 0 ? treeReviews[treeReviews.length - 1] : null
-    const overdue = treeSupports.filter((row) => isSupportOverdue(row.lastCheckDate, row.checkCycleMon))
+    // 每件加固件的最新一条检查（同日取后录入），用于超期判定与最近检查汇总
+    const overdue = treeSupports.filter((row) => {
+      const latestCheck = latestSupportCheck(treeSupportChecks.filter((check) => check.supportId === row.id))
+      return isSupportOverdue(latestCheck === null ? '' : latestCheck.date, row.checkCycleMon)
+    })
+    const latestSupportCheckRow = treeSupports
+      .map((row) => ({
+        support: row,
+        check: latestSupportCheck(treeSupportChecks.filter((check) => check.supportId === row.id)),
+      }))
+      .filter((entry): entry is { support: Support; check: SupportCheck } => entry.check !== null)
+      .sort((a, b) =>
+        b.check.date.localeCompare(a.check.date) || b.check.createdAt.localeCompare(a.check.createdAt),
+      )[0]
     lines.push(
       [
         tree.code,
@@ -136,7 +155,25 @@ export function buildTreeCsv(
         treeMeasures.filter((row) => row.state === '已完成').length,
         tree.lastMeasureDate === '' ? '—' : tree.lastMeasureDate,
         treeSupports.length,
-        overdue.length === 0 ? '无' : overdue.map((row) => `${row.type}超期 ${overdueDays(row.lastCheckDate, row.checkCycleMon)} 天`).join('；'),
+        treeSupportChecks.length,
+        latestSupportCheckRow === undefined
+          ? '—'
+          : `${latestSupportCheckRow.support.type} ${latestSupportCheckRow.check.date} ${latestSupportCheckRow.check.inspector || '检查人未记录'}`,
+        overdue.length === 0
+          ? '无'
+          : overdue
+              .map((row) => {
+                const latestCheck = latestSupportCheck(
+                  treeSupportChecks.filter((check) => check.supportId === row.id),
+                )
+                return latestCheck === null
+                  ? `${row.type}未检查`
+                  : `${row.type}超期 ${overdueDays(latestCheck.date, row.checkCycleMon)} 天（下次 ${nextCheckDate(
+                      latestCheck.date,
+                      row.checkCycleMon,
+                    )}）`
+              })
+              .join('；'),
         treeReviews.length,
         latestReview === null ? '—' : latestReview.vigor,
         latestReview === null ? '—' : latestReview.trend,
@@ -155,9 +192,14 @@ export function exportTreeCsvFile(
   measures: Measure[],
   supports: Support[],
   reviews: Review[],
+  supportChecks: SupportCheck[] = [],
 ): string {
   const filename = `古树名木养护总览-${stampSuffix()}.csv`
-  download(filename, buildTreeCsv(trees, surveys, measures, supports, reviews), 'text/csv;charset=utf-8')
+  download(
+    filename,
+    buildTreeCsv(trees, surveys, measures, supports, reviews, supportChecks),
+    'text/csv;charset=utf-8',
+  )
   return filename
 }
 
@@ -174,19 +216,24 @@ export async function copyText(text: string): Promise<boolean> {
   return false
 }
 
-/** 生成复评与复壮待办纯文本 */
+/** 生成复评与复壮待办纯文本（超期加固件以每件最新一条检查记录为准） */
 export function buildTodoText(
   trees: Tree[],
   measures: Measure[],
   supports: Support[],
   reviews: Review[],
+  supportChecks: SupportCheck[] = [],
 ): string {
   const lines: string[] = [`【古树名木复壮养护待办】共 ${trees.length} 株在档`]
   trees.forEach((tree) => {
     const pending = measures.filter((row) => row.treeId === tree.id && row.state !== '已完成').length
-    const overdue = supports.filter(
-      (row) => row.treeId === tree.id && isSupportOverdue(row.lastCheckDate, row.checkCycleMon),
-    ).length
+    const treeSupports = supports.filter((row) => row.treeId === tree.id)
+    const overdue = treeSupports.filter((row) => {
+      const latestCheck = latestSupportCheck(
+        supportChecks.filter((check) => check.supportId === row.id),
+      )
+      return isSupportOverdue(latestCheck === null ? '' : latestCheck.date, row.checkCycleMon)
+    }).length
     const treeReviews = reviews.filter((row) => row.treeId === tree.id).sort((a, b) => a.date.localeCompare(b.date))
     const latest = treeReviews.length > 0 ? treeReviews[treeReviews.length - 1] : null
     lines.push(

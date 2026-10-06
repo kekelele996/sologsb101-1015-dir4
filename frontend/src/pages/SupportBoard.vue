@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
  * /supports 支撑加固与避雷件登记
- * 超周期未检查的加固件自动高亮并生成检查提醒，支持一键登记本次检查。
- * 消费模型：Support、Tree；复用组件：<StatBadge>、<EmptyPanel>、<FilterBar>、<VigorTag>
+ * 每次检查单独记一条（检查日期、检查人、检查结论）；超期提示与下次检查日期以最新一条为准，
+ * 同一天补记两条的按后录入的那条算，从未登记检查的按未检查提示。
+ * 消费模型：Support、SupportCheck、Tree；复用组件：<StatBadge>、<EmptyPanel>、<FilterBar>、<VigorTag>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
@@ -12,14 +13,30 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import VigorTag from '@/components/common/VigorTag.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useTreeStore } from '@/stores/treeStore'
-import { db, markSupportChecked } from '@/utils/db'
-import { SUPPORT_TYPE_OPTIONS, type Support, type SupportDraft, type SupportType } from '@/types/support'
-import { isSupportOverdue, nextCheckDate, overdueDays } from '@/utils/dimension'
+import { addSupportCheck, db, removeSupport } from '@/utils/db'
+import {
+  SUPPORT_TYPE_OPTIONS,
+  type Support,
+  type SupportCheck,
+  type SupportCheckDraft,
+  type SupportDraft,
+  type SupportType,
+} from '@/types/support'
+import {
+  isSupportOverdue,
+  latestSupportCheck,
+  nextCheckDate,
+  overdueDays,
+  sortSupportChecks,
+} from '@/utils/dimension'
 import { today } from '@/utils/id'
 
 const treeStore = useTreeStore()
 
-const { rows, loading, create, update, remove } = useIdbTable<Support>(db.supports, { sortByUpdatedAt: false })
+const { rows, loading, create, update } = useIdbTable<Support>(db.supports, { sortByUpdatedAt: false })
+const { rows: checkRows, remove: removeCheckRow } = useIdbTable<SupportCheck>(db.supportChecks, {
+  sortByUpdatedAt: false,
+})
 
 const keyword = ref('')
 const treeFilter = ref('all')
@@ -36,7 +53,6 @@ const form = reactive<SupportDraft>({
   type: '支撑杆',
   installDate: '',
   checkCycleMon: 12,
-  lastCheckDate: '',
 })
 
 const rules: FormRules<SupportDraft> = {
@@ -46,9 +62,56 @@ const rules: FormRules<SupportDraft> = {
   checkCycleMon: [{ required: true, message: '请填写检查周期', trigger: 'blur' }],
 }
 
+// 登记检查弹窗
+const checkDialogVisible = ref(false)
+const checkSubmitting = ref(false)
+const checkFormRef = ref<FormInstance>()
+const checkTargetId = ref<string | null>(null)
+
+const checkForm = reactive<SupportCheckDraft>({
+  supportId: '',
+  date: today(),
+  inspector: '',
+  conclusion: '',
+})
+
+const checkRules: FormRules<SupportCheckDraft> = {
+  date: [{ required: true, message: '请选择检查日期', trigger: 'change' }],
+  inspector: [{ required: true, message: '请填写检查人', trigger: 'blur' }],
+  conclusion: [{ required: true, message: '请填写检查结论', trigger: 'blur' }],
+}
+
+// 检查记录弹窗
+const historyDialogVisible = ref(false)
+const historySupportId = ref<string | null>(null)
+
 const treeLabel = computed<Record<string, string>>(() =>
   Object.fromEntries(treeStore.trees.map((tree) => [tree.id, `${tree.code} ${tree.species}`]))
 )
+
+/** 加固件 id -> 该件全部检查记录（按时间先后升序，同日以后录入者在后） */
+const checksBySupport = computed<Map<string, SupportCheck[]>>(() => {
+  const map = new Map<string, SupportCheck[]>()
+  sortSupportChecks(checkRows.value).forEach((check) => {
+    const list = map.get(check.supportId)
+    if (list === undefined) {
+      map.set(check.supportId, [check])
+    } else {
+      list.push(check)
+    }
+  })
+  return map
+})
+
+/** 加固件 id -> 最新一条检查记录（同日取后录入的那条）；没有记录为 null */
+function latestCheckOf(supportId: string): SupportCheck | null {
+  return latestSupportCheck(checksBySupport.value.get(supportId) ?? [])
+}
+
+/** 最新检查日期；未登记任何检查时为空串（按未检查提示） */
+function latestDateOf(supportId: string): string {
+  return latestCheckOf(supportId)?.date ?? ''
+}
 
 const filtered = computed<Support[]>(() => {
   const key = keyword.value.trim().toLowerCase()
@@ -56,29 +119,53 @@ const filtered = computed<Support[]>(() => {
     .filter((row) => {
       if (treeFilter.value !== 'all' && row.treeId !== treeFilter.value) return false
       if (typeFilter.value !== 'all' && row.type !== typeFilter.value) return false
-      if (overdueOnly.value && !isSupportOverdue(row.lastCheckDate, row.checkCycleMon)) return false
+      if (overdueOnly.value && !isSupportOverdue(latestDateOf(row.id), row.checkCycleMon)) return false
       if (key === '') return true
+      const checks = checksBySupport.value.get(row.id) ?? []
       return (
         (treeLabel.value[row.treeId] ?? '').toLowerCase().includes(key) ||
         row.type.toLowerCase().includes(key) ||
-        row.lastCheckDate.includes(key)
+        checks.some(
+          (check) =>
+            check.date.includes(key) ||
+            check.inspector.toLowerCase().includes(key) ||
+            check.conclusion.toLowerCase().includes(key),
+        )
       )
     })
     .sort((a, b) => a.installDate.localeCompare(b.installDate))
 })
 
 const overdueRows = computed<Support[]>(() =>
-  rows.value.filter((row) => isSupportOverdue(row.lastCheckDate, row.checkCycleMon))
+  rows.value.filter((row) => isSupportOverdue(latestDateOf(row.id), row.checkCycleMon))
 )
 
 const coveredTrees = computed<number>(() => new Set(rows.value.map((row) => row.treeId)).size)
+
+const historySupport = computed<Support | null>(
+  () => rows.value.find((row) => row.id === historySupportId.value) ?? null
+)
+
+const historyChecks = computed<SupportCheck[]>(() =>
+  [...(checksBySupport.value.get(historySupportId.value ?? '') ?? [])].reverse()
+)
+
+const checkTarget = computed<Support | null>(
+  () => rows.value.find((row) => row.id === checkTargetId.value) ?? null
+)
+
+const checkTargetNextDate = computed<string>(() =>
+  checkTarget.value === null
+    ? ''
+    : nextCheckDate(checkForm.date || latestDateOf(checkTarget.value.id), checkTarget.value.checkCycleMon)
+)
 
 onMounted(() => {
   void treeStore.loadAll()
 })
 
 function rowClassName({ row }: { row: Support }): string {
-  return isSupportOverdue(row.lastCheckDate, row.checkCycleMon) ? 'row-overdue' : ''
+  return isSupportOverdue(latestDateOf(row.id), row.checkCycleMon) ? 'row-overdue' : ''
 }
 
 function openCreate(): void {
@@ -90,7 +177,6 @@ function openCreate(): void {
     type: '支撑杆' as SupportType,
     installDate: today(),
     checkCycleMon: 12,
-    lastCheckDate: today(),
   })
   dialogVisible.value = true
 }
@@ -102,7 +188,6 @@ function openEdit(row: Support): void {
     type: row.type,
     installDate: row.installDate,
     checkCycleMon: row.checkCycleMon,
-    lastCheckDate: row.lastCheckDate,
   })
   dialogVisible.value = true
 }
@@ -115,7 +200,7 @@ async function handleSubmit(): Promise<void> {
   try {
     if (editingId.value === null) {
       await create({ ...form }, 'support')
-      ElMessage.success('加固件已登记')
+      ElMessage.success('加固件已登记，可继续为其登记检查记录')
     } else {
       await update(editingId.value, { ...form })
       ElMessage.success('加固件已更新')
@@ -130,7 +215,65 @@ async function handleSubmit(): Promise<void> {
 
 async function handleDelete(row: Support): Promise<void> {
   try {
-    await ElMessageBox.confirm(`确认删除「${row.type}」加固件记录？`, '删除确认', {
+    await ElMessageBox.confirm(
+      `确认删除「${row.type}」加固件及其全部 ${checksBySupport.value.get(row.id)?.length ?? 0} 条检查记录？`,
+      '删除确认',
+      {
+        type: 'warning',
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    return
+  }
+  // 走级联删除：连同该件的检查记录一起清掉
+  await removeSupport(row.id)
+  ElMessage.success('加固件记录已删除')
+}
+
+function openCheckDialog(row: Support): void {
+  checkTargetId.value = row.id
+  Object.assign(checkForm, {
+    supportId: row.id,
+    date: today(),
+    inspector: '',
+    conclusion: '',
+  })
+  checkDialogVisible.value = true
+}
+
+function openHistory(row: Support): void {
+  historySupportId.value = row.id
+  historyDialogVisible.value = true
+}
+
+async function handleCheckSubmit(): Promise<void> {
+  if (checkFormRef.value === undefined) return
+  const valid = await checkFormRef.value.validate().catch(() => false)
+  if (!valid) return
+  checkSubmitting.value = true
+  try {
+    await addSupportCheck({
+      supportId: checkForm.supportId,
+      date: checkForm.date,
+      inspector: checkForm.inspector,
+      conclusion: checkForm.conclusion,
+    })
+    ElMessage.success(
+      `已登记 ${treeLabel.value[checkTarget.value?.treeId ?? ''] ?? '该古树'} 的 ${checkTarget.value?.type ?? ''} 检查`,
+    )
+    checkDialogVisible.value = false
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
+  } finally {
+    checkSubmitting.value = false
+  }
+}
+
+async function handleCheckDelete(check: SupportCheck): Promise<void> {
+  try {
+    await ElMessageBox.confirm(`确认删除 ${check.date} 的这条检查记录？`, '删除确认', {
       type: 'warning',
       confirmButtonText: '删除',
       cancelButtonText: '取消',
@@ -138,13 +281,8 @@ async function handleDelete(row: Support): Promise<void> {
   } catch {
     return
   }
-  await remove(row.id)
-  ElMessage.success('加固件记录已删除')
-}
-
-async function handleMarkChecked(row: Support): Promise<void> {
-  await markSupportChecked(row.id, today())
-  ElMessage.success(`已登记 ${treeLabel.value[row.treeId] ?? '该古树'} 的 ${row.type} 本次检查`)
+  await removeCheckRow(check.id)
+  ElMessage.success('检查记录已删除')
 }
 
 function handleFilterChange(key: string, value: string): void {
@@ -157,13 +295,14 @@ function handleFilterChange(key: string, value: string): void {
   <div>
     <div class="stat-row">
       <StatBadge label="加固件总数" :value="rows.length" suffix="件" tone="primary" icon="Histogram" />
+      <StatBadge label="累计检查" :value="checkRows.length" suffix="次" tone="info" icon="DataLine" />
       <StatBadge
         label="超期未检查"
         :value="overdueRows.length"
         suffix="件"
         :tone="overdueRows.length > 0 ? 'danger' : 'success'"
         icon="Warning"
-        hint="超过检查周期（月）仍未登记检查的加固件"
+        hint="以每件加固件最新一条检查记录为准：超过检查周期（月）或从未检查"
       />
       <StatBadge label="覆盖古树" :value="coveredTrees" suffix="株" tone="info" icon="DataLine" />
       <StatBadge label="筛选结果" :value="filtered.length" suffix="件" tone="default" icon="PieChart" size="small" />
@@ -180,9 +319,13 @@ function handleFilterChange(key: string, value: string): void {
       <template #default>
         <div class="overdue-list">
           <div v-for="row in overdueRows" :key="row.id">
-            {{ treeLabel[row.treeId] ?? '（古树已删除）' }} · {{ row.type }}：最近检查
-            {{ row.lastCheckDate || '未记录' }}，检查周期 {{ row.checkCycleMon }} 个月，已超期
-            {{ overdueDays(row.lastCheckDate, row.checkCycleMon) }} 天
+            {{ treeLabel[row.treeId] ?? '（古树已删除）' }} · {{ row.type }}：
+            <template v-if="latestCheckOf(row.id) === null">从未检查</template>
+            <template v-else>
+              最近检查 {{ latestDateOf(row.id) }}（{{ latestCheckOf(row.id)?.inspector || '检查人未记录' }}）
+            </template>
+            ，检查周期 {{ row.checkCycleMon }} 个月，已超期
+            {{ overdueDays(latestDateOf(row.id), row.checkCycleMon) }} 天
           </div>
         </div>
       </template>
@@ -231,7 +374,7 @@ function handleFilterChange(key: string, value: string): void {
       <EmptyPanel
         v-if="rows.length === 0 && !loading"
         title="还没有加固件记录"
-        description="登记支撑杆、拉纤与避雷件，设置检查周期后系统会自动高亮超期未检查的设施并生成提醒。"
+        description="登记支撑杆、拉纤与避雷件，设置检查周期后每次检查单独记一条；超期以最新一条检查记录为准自动高亮并提醒。"
         action-text="登记第一件加固件"
         @action="openCreate"
       />
@@ -256,44 +399,67 @@ function handleFilterChange(key: string, value: string): void {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="类型" width="110">
+        <el-table-column label="类型" width="100">
           <template #default="{ row }">
             <el-tag :type="row.type === '避雷' ? 'warning' : row.type === '拉纤' ? 'info' : 'success'">
               {{ row.type }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="installDate" label="安装日期" width="120" />
-        <el-table-column label="检查周期" width="110" align="right">
+        <el-table-column prop="installDate" label="安装日期" width="115" />
+        <el-table-column label="检查周期" width="100" align="right">
           <template #default="{ row }">{{ row.checkCycleMon }} 个月</template>
         </el-table-column>
-        <el-table-column label="最近检查" width="130">
+        <el-table-column label="最近检查" min-width="210">
           <template #default="{ row }">
-            <span v-if="row.lastCheckDate === ''" class="cell-warn">未记录</span>
-            <span v-else>{{ row.lastCheckDate }}</span>
+            <div v-if="latestCheckOf(row.id) === null" class="cell-warn">未检查</div>
+            <div v-else class="cell-stack">
+              <span>{{ latestCheckOf(row.id)?.date }} · {{ latestCheckOf(row.id)?.inspector || '检查人未记录' }}</span>
+              <el-tooltip
+                v-if="latestCheckOf(row.id)?.conclusion"
+                :content="latestCheckOf(row.id)?.conclusion"
+                placement="top"
+                :show-after="200"
+              >
+                <span class="cell-sub cell-ellipsis">结论：{{ latestCheckOf(row.id)?.conclusion }}</span>
+              </el-tooltip>
+              <span v-else class="cell-sub">结论：—</span>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="下次检查" width="130">
-          <template #default="{ row }">{{ nextCheckDate(row.lastCheckDate, row.checkCycleMon) || '—' }}</template>
-        </el-table-column>
-        <el-table-column label="检查状态" width="180">
+        <el-table-column label="检查次数" width="90" align="right">
           <template #default="{ row }">
-            <el-tag v-if="isSupportOverdue(row.lastCheckDate, row.checkCycleMon)" type="danger" effect="dark">
-              超期 {{ overdueDays(row.lastCheckDate, row.checkCycleMon) }} 天
+            <el-button link type="primary" size="small" @click="openHistory(row)">
+              {{ checksBySupport.get(row.id)?.length ?? 0 }} 次
+            </el-button>
+          </template>
+        </el-table-column>
+        <el-table-column label="下次检查" width="120">
+          <template #default="{ row }">{{ nextCheckDate(latestDateOf(row.id), row.checkCycleMon) || '—' }}</template>
+        </el-table-column>
+        <el-table-column label="检查状态" width="170">
+          <template #default="{ row }">
+            <el-tag
+              v-if="isSupportOverdue(latestDateOf(row.id), row.checkCycleMon)"
+              type="danger"
+              effect="dark"
+            >
+              {{ latestCheckOf(row.id) === null ? '未检查' : `超期 ${overdueDays(latestDateOf(row.id), row.checkCycleMon)} 天` }}
             </el-tag>
             <el-tag v-else type="success" effect="light">周期内</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="260" fixed="right">
+        <el-table-column label="操作" width="300" fixed="right">
           <template #default="{ row }">
             <el-button
               link
-              :type="isSupportOverdue(row.lastCheckDate, row.checkCycleMon) ? 'danger' : 'primary'"
+              :type="isSupportOverdue(latestDateOf(row.id), row.checkCycleMon) ? 'danger' : 'primary'"
               size="small"
-              @click="handleMarkChecked(row)"
+              @click="openCheckDialog(row)"
             >
-              登记本次检查
+              登记检查
             </el-button>
+            <el-button link type="primary" size="small" @click="openHistory(row)">检查记录</el-button>
             <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
             <el-button link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
           </template>
@@ -301,6 +467,7 @@ function handleFilterChange(key: string, value: string): void {
       </el-table>
     </el-card>
 
+    <!-- 登记 / 编辑加固件 -->
     <el-dialog v-model="dialogVisible" :title="editingId === null ? '登记加固件' : '编辑加固件'" width="600px">
       <el-form ref="formRef" :model="form" :rules="rules" label-width="120px">
         <el-form-item label="古树" prop="treeId">
@@ -327,29 +494,107 @@ function handleFilterChange(key: string, value: string): void {
             </el-form-item>
           </el-col>
         </el-row>
-        <el-row :gutter="12">
-          <el-col :span="12">
-            <el-form-item label="检查周期（月）" prop="checkCycleMon">
-              <el-input-number v-model="form.checkCycleMon" :min="1" :max="120" :step="1" style="width: 100%" />
-            </el-form-item>
-          </el-col>
-          <el-col :span="12">
-            <el-form-item label="最近检查日期">
-              <el-date-picker v-model="form.lastCheckDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
-            </el-form-item>
-          </el-col>
-        </el-row>
+        <el-form-item label="检查周期（月）" prop="checkCycleMon">
+          <el-input-number v-model="form.checkCycleMon" :min="1" :max="120" :step="1" style="width: 100%" />
+        </el-form-item>
         <el-alert
           type="info"
           show-icon
           :closable="false"
-          :title="`下次检查日期：${nextCheckDate(form.lastCheckDate, form.checkCycleMon) || '请先填写最近检查日期'}`"
-          description="超过下次检查日期仍未登记检查的加固件，会在列表中自动高亮并出现在顶部提醒中。"
+          title="检查不在这里登记"
+          description="保存后请在列表中点「登记检查」，每次检查会单独记录检查日期、检查人与检查结论；超期提示与下次检查日期以最新一条检查记录为准。"
         />
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="submitting" @click="handleSubmit">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 登记检查 -->
+    <el-dialog
+      v-model="checkDialogVisible"
+      :title="checkTarget === null ? '登记检查' : `登记检查 · ${treeLabel[checkTarget.treeId] ?? ''} ${checkTarget.type}`"
+      width="560px"
+    >
+      <el-form ref="checkFormRef" :model="checkForm" :rules="checkRules" label-width="100px">
+        <el-row :gutter="12">
+          <el-col :span="12">
+            <el-form-item label="检查日期" prop="date">
+              <el-date-picker v-model="checkForm.date" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item label="检查人" prop="inspector">
+              <el-input v-model="checkForm.inspector" maxlength="32" placeholder="如：王建军" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-form-item label="检查结论" prop="conclusion">
+          <el-input
+            v-model="checkForm.conclusion"
+            type="textarea"
+            :rows="3"
+            maxlength="200"
+            show-word-limit
+            placeholder="如：支撑杆牢固、焊缝正常，检查结论正常。"
+          />
+        </el-form-item>
+        <el-alert
+          v-if="checkTargetNextDate !== ''"
+          type="info"
+          show-icon
+          :closable="false"
+          :title="`本次检查后下次检查日期：${checkTargetNextDate}`"
+          description="同一天补记两条检查时，以最后录入的那条作为最新检查。"
+        />
+      </el-form>
+      <template #footer>
+        <el-button @click="checkDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="checkSubmitting" @click="handleCheckSubmit">保存检查</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 检查记录 -->
+    <el-dialog
+      v-model="historyDialogVisible"
+      :title="
+        historySupport === null
+          ? '检查记录'
+          : `检查记录 · ${treeLabel[historySupport.treeId] ?? ''} ${historySupport.type}`
+      "
+      width="720px"
+    >
+      <el-empty v-if="historyChecks.length === 0" description="还没有检查记录" />
+      <el-table v-else :data="historyChecks" row-key="id" stripe size="small">
+        <el-table-column prop="date" label="检查日期" width="115" />
+        <el-table-column prop="inspector" label="检查人" width="110">
+          <template #default="{ row }">{{ row.inspector || '—' }}</template>
+        </el-table-column>
+        <el-table-column label="检查结论" min-width="260">
+          <template #default="{ row }">{{ row.conclusion || '—' }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="130" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="danger" size="small" @click="handleCheckDelete(row)">删除</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <template #footer>
+        <el-button
+          v-if="historySupport !== null"
+          type="primary"
+          @click="
+            () => {
+              const target = historySupport
+              historyDialogVisible = false
+              if (target !== null) openCheckDialog(target)
+            }
+          "
+        >
+          补记检查
+        </el-button>
+        <el-button @click="historyDialogVisible = false">关闭</el-button>
       </template>
     </el-dialog>
   </div>
@@ -389,6 +634,18 @@ function handleFilterChange(key: string, value: string): void {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.cell-sub {
+  font-size: 12px;
+  color: #8c8479;
+}
+
+.cell-ellipsis {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cell-warn {
