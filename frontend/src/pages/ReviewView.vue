@@ -16,7 +16,7 @@ import { HISTORY_KIND_LABEL, useTreeHistory } from '@/hooks/useTreeHistory'
 import { useReviewStore } from '@/stores/reviewStore'
 import { useTreeStore } from '@/stores/treeStore'
 import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
-import { exportSnapshotJson, exportTreeCsvFile, parseSnapshot } from '@/utils/export'
+import { exportSnapshotJson, exportTreeCsvFile, parseSnapshot, buildTodoText, copyText } from '@/utils/export'
 import { TREND_OPTIONS, VIGOR_OPTIONS, VIGOR_NEED_FOLLOW_UP, type Review, type ReviewDraft, type Trend, type Vigor } from '@/types/review'
 
 const router = useRouter()
@@ -173,9 +173,23 @@ function handleExportCsv(): void {
     treeStore.surveys,
     treeStore.measures,
     treeStore.supports,
-    treeStore.reviews
+    treeStore.reviews,
+    treeStore.supportChecks
   )
   ElMessage.success(`已导出古树养护总览 ${filename}`)
+}
+
+async function handleCopyTodo(): Promise<void> {
+  const text = buildTodoText(
+    treeStore.trees,
+    treeStore.measures,
+    treeStore.supports,
+    treeStore.reviews,
+    treeStore.supportChecks
+  )
+  const ok = await copyText(text)
+  if (ok) ElMessage.success('待办文本已复制到剪贴板')
+  else ElMessage.error('复制失败，请检查浏览器剪贴板权限')
 }
 
 async function handleImport(uploadFile: UploadFile): Promise<void> {
@@ -270,6 +284,10 @@ function handleFilterChange(key: string, value: string): void {
                 <el-button @click="handleExportCsv">
                   <el-icon><Download /></el-icon>
                   <span>导出 CSV 汇总</span>
+                </el-button>
+                <el-button @click="handleCopyTodo">
+                  <el-icon><DocumentCopy /></el-icon>
+                  <span>复制待办文本</span>
                 </el-button>
                 <el-upload
                   :auto-upload="false"

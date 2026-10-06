@@ -7,7 +7,7 @@ import { computed, onScopeDispose, ref, type ComputedRef, type Ref } from 'vue'
 import { liveQuery } from 'dexie'
 import type { Survey } from '../types/survey'
 import type { Measure } from '../types/measure'
-import type { Support } from '../types/support'
+import type { Support, SupportCheck } from '../types/support'
 import type { Review } from '../types/review'
 import { db, initDatabase } from '../utils/db'
 
@@ -31,12 +31,13 @@ export const HISTORY_KIND_LABEL: Record<HistoryKind, string> = {
   review: '长势复评',
 }
 
-/** 纯函数：把四类记录聚合成时间线 */
+/** 纯函数：把四类记录聚合成时间线（加固件安装与每次检查分别成条） */
 export function buildHistory(
   surveys: Survey[],
   measures: Measure[],
   supports: Support[],
-  reviews: Review[]
+  reviews: Review[],
+  supportChecks: SupportCheck[] = []
 ): HistoryItem[] {
   const items: HistoryItem[] = []
   surveys.forEach((row) => {
@@ -59,14 +60,27 @@ export function buildHistory(
       badge: row.state,
     })
   })
+  const supportName = new Map(supports.map((row) => [row.id, row]))
   supports.forEach((row) => {
     items.push({
-      key: `support-${row.id}`,
+      key: `support-install-${row.id}`,
       kind: 'support',
       date: row.installDate,
-      title: `加固件 · ${row.type}`,
-      detail: `安装于 ${row.installDate}，检查周期 ${row.checkCycleMon} 个月，最近检查 ${row.lastCheckDate || '未记录'}`,
+      title: `加固件安装 · ${row.type}`,
+      detail: `安装于 ${row.installDate}，检查周期 ${row.checkCycleMon} 个月。`,
       badge: row.type,
+    })
+  })
+  supportChecks.forEach((row) => {
+    const support = supportName.get(row.supportId)
+    const label = support === undefined ? '加固件' : support.type
+    items.push({
+      key: `supportcheck-${row.id}`,
+      kind: 'support',
+      date: row.date,
+      title: `加固件检查 · ${label}`,
+      detail: `检查人：${row.inspector || '未登记'}；检查结论：${row.conclusion || '未填写'}`,
+      badge: label,
     })
   })
   reviews.forEach((row) => {
@@ -99,6 +113,7 @@ export function useTreeHistory(treeId: Ref<string | null> | string | null): UseT
   const surveys = ref<Survey[]>([])
   const measures = ref<Measure[]>([])
   const supports = ref<Support[]>([])
+  const supportChecks = ref<SupportCheck[]>([])
   const reviews = ref<Review[]>([])
   const loading = ref(true)
   const error = ref('')
@@ -106,18 +121,20 @@ export function useTreeHistory(treeId: Ref<string | null> | string | null): UseT
   void initDatabase()
   const subscription = liveQuery(async () => {
     await initDatabase()
-    const [surveyRows, measureRows, supportRows, reviewRows] = await Promise.all([
+    const [surveyRows, measureRows, supportRows, supportCheckRows, reviewRows] = await Promise.all([
       db.surveys.toArray(),
       db.measures.toArray(),
       db.supports.toArray(),
+      db.supportChecks.toArray(),
       db.reviews.toArray(),
     ])
-    return { surveyRows, measureRows, supportRows, reviewRows }
+    return { surveyRows, measureRows, supportRows, supportCheckRows, reviewRows }
   }).subscribe({
-    next: ({ surveyRows, measureRows, supportRows, reviewRows }) => {
+    next: ({ surveyRows, measureRows, supportRows, supportCheckRows, reviewRows }) => {
       surveys.value = surveyRows
       measures.value = measureRows
       supports.value = supportRows
+      supportChecks.value = supportCheckRows
       reviews.value = reviewRows
       loading.value = false
       error.value = ''
@@ -139,7 +156,8 @@ export function useTreeHistory(treeId: Ref<string | null> | string | null): UseT
       surveys.value.filter((row) => row.treeId === id),
       measures.value.filter((row) => row.treeId === id),
       supports.value.filter((row) => row.treeId === id),
-      reviews.value.filter((row) => row.treeId === id)
+      reviews.value.filter((row) => row.treeId === id),
+      supportChecks.value.filter((row) => row.treeId === id)
     )
   })
 

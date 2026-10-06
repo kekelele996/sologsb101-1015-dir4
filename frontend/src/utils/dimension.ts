@@ -101,13 +101,41 @@ export function worseVigor(a: Vigor, b: Vigor): Vigor {
 
 /**
  * 加固件是否超期未检查。
- * 依据 installDate / lastCheckDate 加上 checkCycleMon 个月，与今天比较。
+ * 依据最近一次检查日期加上 checkCycleMon 个月，与今天比较；从未登记检查时提示未检查（按超期处理）。
  */
 export function isSupportOverdue(lastCheckDate: string, checkCycleMon: number, reference = today()): boolean {
   const base = lastCheckDate === '' ? '' : lastCheckDate
   if (base === '') return true
   const next = addMonths(base, checkCycleMon)
   return next < reference
+}
+
+/**
+ * 取某件加固件最新的一条检查记录。
+ * 先按检查日期取最大；同一天补记多条时，以后录入（createdAt 更大）的那条为准。
+ */
+export interface SupportCheckLike {
+  date: string
+  createdAt?: string
+}
+
+export function latestSupportCheck<T extends SupportCheckLike>(checks: T[]): T | null {
+  if (checks.length === 0) return null
+  return checks.reduce((latest, current) => {
+    const byDate = current.date.localeCompare(latest.date)
+    if (byDate > 0) return current
+    if (byDate === 0 && (current.createdAt ?? '').localeCompare(latest.createdAt ?? '') > 0) return current
+    return latest
+  })
+}
+
+/** 加固件检查状态：未检查（从未登记）/ 超期 / 周期内 */
+export type SupportCheckState = 'unchecked' | 'overdue' | 'current'
+
+/** 按最近检查日期判定加固件检查状态 */
+export function supportCheckState(lastCheckDate: string, checkCycleMon: number, reference = today()): SupportCheckState {
+  if (lastCheckDate === '') return 'unchecked'
+  return isSupportOverdue(lastCheckDate, checkCycleMon, reference) ? 'overdue' : 'current'
 }
 
 /** 加固件下次检查日期 */

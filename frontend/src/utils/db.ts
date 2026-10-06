@@ -9,16 +9,16 @@ import Dexie, { type Table } from 'dexie'
 import type { Tree } from '../types/tree'
 import type { Survey } from '../types/survey'
 import type { Measure, MeasureState } from '../types/measure'
-import type { Support } from '../types/support'
+import type { Support, SupportCheck } from '../types/support'
 import type { Review } from '../types/review'
-import { nowIso, today } from './id'
+import { nowIso, uuid } from './id'
 import { seedDatabase } from './seed'
 
 /** 数据库名 */
 export const DB_NAME = 'gbheritagetree'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
 export const ROW_REVISION = 2
@@ -28,6 +28,7 @@ class HeritageTreeDatabase extends Dexie {
   surveys!: Table<Survey, string>
   measures!: Table<Measure, string>
   supports!: Table<Support, string>
+  supportChecks!: Table<SupportCheck, string>
   reviews!: Table<Review, string>
 
   constructor() {
@@ -43,7 +44,7 @@ class HeritageTreeDatabase extends Dexie {
     })
 
     // ---------- v2：补齐索引与回写字段，并迁移历史数据 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         trees: 'id, code, species, protectLevel, ageYears, createdAt, updatedAt, owner',
         // 复合索引 [treeId+date]：按古树 + 日期快速取检查记录
@@ -80,6 +81,45 @@ class HeritageTreeDatabase extends Dexie {
         await tx.table('supports').toCollection().modify((row: Record<string, unknown>) => {
           if (typeof row.lastCheckDate !== 'string') row.lastCheckDate = ''
           if (typeof row.checkCycleMon !== 'number') row.checkCycleMon = 12
+        })
+      })
+
+    // ---------- v3：加固件每次检查独立成表（supportChecks） ----------
+    // supports 去掉 lastCheckDate 字段与索引；检查记录单独入 supportChecks，
+    // 超期提示与下次检查日期一律以最新一条检查记录为准。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        trees: 'id, code, species, protectLevel, ageYears, createdAt, updatedAt, owner',
+        surveys: 'id, treeId, [treeId+date], date, siteNote',
+        measures: 'id, treeId, type, state, date, operator',
+        supports: 'id, treeId, type, installDate',
+        supportChecks: 'id, supportId, treeId, date',
+        reviews: 'id, treeId, date, vigor, trend',
+      })
+      .upgrade(async (tx) => {
+        // 把 v2 的「最近检查日期」迁移为首条历史检查记录（无检查人/结论，留空待补）。
+        // 同一天补记多条以后录为准，迁移只产生一条，不影响该规则。
+        const stamp = nowIso()
+        const legacySupports = await tx.table<Support & { lastCheckDate?: string }, string>('supports').toArray()
+        const migrated: SupportCheck[] = legacySupports
+          .filter((row) => typeof row.lastCheckDate === 'string' && row.lastCheckDate !== '')
+          .map((row) => ({
+            id: uuid('supportcheck'),
+            supportId: row.id,
+            treeId: row.treeId,
+            date: row.lastCheckDate as string,
+            inspector: '',
+            conclusion: '历史数据迁移（原最近检查日期）',
+            createdAt: stamp,
+            updatedAt: stamp,
+            revision: ROW_REVISION,
+          }))
+        if (migrated.length > 0) {
+          await tx.table('supportChecks').bulkPut(migrated)
+        }
+        // 加固件本体不再保存最近检查日期
+        await tx.table('supports').toCollection().modify((row: Record<string, unknown>) => {
+          delete row.lastCheckDate
         })
       })
   }
@@ -123,15 +163,24 @@ export async function putTree(row: Tree): Promise<void> {
   await db.trees.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
 }
 
-/** 删除古树并级联清理其检查、措施、加固与复评记录 */
+/** 删除古树并级联清理其检查、措施、加固（含检查记录）与复评记录 */
 export async function removeTree(id: string): Promise<void> {
-  await db.transaction('rw', db.trees, db.surveys, db.measures, db.supports, db.reviews, async () => {
-    await db.surveys.where('treeId').equals(id).delete()
-    await db.measures.where('treeId').equals(id).delete()
-    await db.supports.where('treeId').equals(id).delete()
-    await db.reviews.where('treeId').equals(id).delete()
-    await db.trees.delete(id)
-  })
+  await db.transaction(
+    'rw',
+    [db.trees, db.surveys, db.measures, db.supports, db.supportChecks, db.reviews],
+    async () => {
+      const supportIds = (await db.supports.where('treeId').equals(id).primaryKeys()) as string[]
+      await db.surveys.where('treeId').equals(id).delete()
+      await db.measures.where('treeId').equals(id).delete()
+      if (supportIds.length > 0) {
+        await db.supportChecks.where('supportId').anyOf(supportIds).delete()
+      }
+      await db.supportChecks.where('treeId').equals(id).delete()
+      await db.supports.where('treeId').equals(id).delete()
+      await db.reviews.where('treeId').equals(id).delete()
+      await db.trees.delete(id)
+    },
+  )
 }
 
 /* ------------------------------ 树体检查 ------------------------------ */
@@ -211,13 +260,58 @@ export async function putSupport(row: Support): Promise<void> {
   await db.supports.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
 }
 
+/** 删除加固件并级联清理它的全部检查记录 */
 export async function removeSupport(id: string): Promise<void> {
-  await db.supports.delete(id)
+  await db.transaction('rw', db.supports, db.supportChecks, async () => {
+    await db.supportChecks.where('supportId').equals(id).delete()
+    await db.supports.delete(id)
+  })
 }
 
-/** 登记本次检查：把最近检查日期置为给定日期（默认今天） */
-export async function markSupportChecked(id: string, date = today()): Promise<void> {
-  await db.supports.update(id, { lastCheckDate: date, updatedAt: nowIso() })
+/* ------------------------------ 加固件检查 ------------------------------ */
+
+export async function listSupportChecks(): Promise<SupportCheck[]> {
+  return db.supportChecks.toArray()
+}
+
+export async function listSupportChecksBySupport(supportId: string): Promise<SupportCheck[]> {
+  return db.supportChecks.where('supportId').equals(supportId).toArray()
+}
+
+export async function putSupportCheck(row: SupportCheck): Promise<void> {
+  await db.supportChecks.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
+}
+
+/**
+ * 登记一次加固件检查：每次检查单独写入一条记录。
+ * 同一天补记多条时，以录入时间（createdAt）更晚的那条作为最新检查。
+ */
+export async function addSupportCheck(input: {
+  supportId: string
+  date: string
+  inspector: string
+  conclusion: string
+}): Promise<SupportCheck> {
+  const support = await db.supports.get(input.supportId)
+  if (!support) throw new Error('加固件不存在或已被删除')
+  const stamp = nowIso()
+  const record: SupportCheck = {
+    id: uuid('supportcheck'),
+    supportId: input.supportId,
+    treeId: support.treeId,
+    date: input.date,
+    inspector: input.inspector,
+    conclusion: input.conclusion,
+    createdAt: stamp,
+    updatedAt: stamp,
+    revision: ROW_REVISION,
+  }
+  await db.supportChecks.put(record)
+  return record
+}
+
+export async function removeSupportCheck(id: string): Promise<void> {
+  await db.supportChecks.delete(id)
 }
 
 /* ------------------------------ 长势复评 ------------------------------ */
@@ -250,61 +344,114 @@ export interface DatabaseSnapshot {
   surveys: Survey[]
   measures: Measure[]
   supports: Support[]
+  supportChecks: SupportCheck[]
   reviews: Review[]
 }
 
 /** 导出整库快照 */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [trees, surveys, measures, supports, reviews] = await Promise.all([
+  const [trees, surveys, measures, supports, supportChecks, reviews] = await Promise.all([
     db.trees.toArray(),
     db.surveys.toArray(),
     db.measures.toArray(),
     db.supports.toArray(),
+    db.supportChecks.toArray(),
     db.reviews.toArray(),
   ])
-  return { name: DB_NAME, schemaVersion: DB_SCHEMA_VERSION, exportedAt: nowIso(), trees, surveys, measures, supports, reviews }
+  return {
+    name: DB_NAME,
+    schemaVersion: DB_SCHEMA_VERSION,
+    exportedAt: nowIso(),
+    trees,
+    surveys,
+    measures,
+    supports,
+    supportChecks,
+    reviews,
+  }
 }
 
-/** 用快照覆盖整库（导入存档） */
+/** 用快照覆盖整库（导入存档）；兼容旧版无 supportChecks 数组的存档 */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', db.trees, db.surveys, db.measures, db.supports, db.reviews, async () => {
-    await Promise.all([
-      db.trees.clear(),
-      db.surveys.clear(),
-      db.measures.clear(),
-      db.supports.clear(),
-      db.reviews.clear(),
-    ])
-    await db.trees.bulkPut(snapshot.trees.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.measures.bulkPut(snapshot.measures.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.supports.bulkPut(snapshot.supports.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.reviews.bulkPut(snapshot.reviews.map((row) => ({ ...row, revision: ROW_REVISION })))
-  })
+  await db.transaction(
+    'rw',
+    [db.trees, db.surveys, db.measures, db.supports, db.supportChecks, db.reviews],
+    async () => {
+      await Promise.all([
+        db.trees.clear(),
+        db.surveys.clear(),
+        db.measures.clear(),
+        db.supports.clear(),
+        db.supportChecks.clear(),
+        db.reviews.clear(),
+      ])
+      await db.trees.bulkPut(snapshot.trees.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.measures.bulkPut(snapshot.measures.map((row) => ({ ...row, revision: ROW_REVISION })))
+      await db.supports.bulkPut(snapshot.supports.map(stripLegacyLastCheck))
+      const stamp = nowIso()
+      // 兼容旧版（v2 及以前）存档：把 lastCheckDate 补成首条历史检查记录
+      const legacyChecks: SupportCheck[] = snapshot.supports.flatMap((support) => {
+        const legacyDate = (support as Support & { lastCheckDate?: string }).lastCheckDate
+        if (typeof legacyDate !== 'string' || legacyDate === '') return []
+        return [
+          {
+            id: uuid('supportcheck'),
+            supportId: support.id,
+            treeId: support.treeId,
+            date: legacyDate,
+            inspector: '',
+            conclusion: '历史数据迁移（原最近检查日期）',
+            createdAt: stamp,
+            updatedAt: stamp,
+            revision: ROW_REVISION,
+          },
+        ]
+      })
+      await db.supportChecks.bulkPut(
+        [...snapshot.supportChecks.map((row) => ({ ...row, revision: ROW_REVISION })), ...legacyChecks],
+      )
+      await db.reviews.bulkPut(snapshot.reviews.map((row) => ({ ...row, revision: ROW_REVISION })))
+    },
+  )
+}
+
+/** 旧版（v2 及以前）加固件行带有 lastCheckDate，导入时剔除该冗余字段 */
+function stripLegacyLastCheck(row: Support): Support {
+  const legacy = row as Support & { lastCheckDate?: string }
+  const { lastCheckDate: _legacy, ...rest } = legacy
+  void _legacy
+  return { ...rest, revision: ROW_REVISION }
 }
 
 /** 清空全部数据并重新灌入演示数据 */
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', db.trees, db.surveys, db.measures, db.supports, db.reviews, async () => {
-    await Promise.all([
-      db.trees.clear(),
-      db.surveys.clear(),
-      db.measures.clear(),
-      db.supports.clear(),
-      db.reviews.clear(),
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.trees, db.surveys, db.measures, db.supports, db.supportChecks, db.reviews],
+    async () => {
+      await Promise.all([
+        db.trees.clear(),
+        db.surveys.clear(),
+        db.measures.clear(),
+        db.supports.clear(),
+        db.supportChecks.clear(),
+        db.reviews.clear(),
+      ])
+    },
+  )
   await seedDatabase()
 }
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [trees, surveys, measures, supports, reviews] = await Promise.all([
+  const [trees, surveys, measures, supports, supportChecks, reviews] = await Promise.all([
     db.trees.count(),
     db.surveys.count(),
     db.measures.count(),
     db.supports.count(),
+    db.supportChecks.count(),
     db.reviews.count(),
   ])
-  return { trees, surveys, measures, supports, reviews }
+  return { trees, surveys, measures, supports, supportChecks, reviews }
 }

@@ -1,6 +1,7 @@
 /**
- * 加固件（Support）
+ * 加固件（Support）与加固件检查记录（SupportCheck）
  * 支撑杆、拉纤、避雷设施，按检查周期自动提示超期未检查。
+ * 每次检查单独记成一条 SupportCheck，超期与下次检查日期以最新一条检查记录为准。
  */
 
 /** 加固件类型 */
@@ -18,8 +19,6 @@ export interface Support {
   installDate: string
   /** 检查周期（月） */
   checkCycleMon: number
-  /** 最近检查日期 YYYY-MM-DD */
-  lastCheckDate: string
   createdAt: string
   updatedAt: string
   revision: number
@@ -31,5 +30,31 @@ export interface SupportDraft {
   type: SupportType
   installDate: string
   checkCycleMon: number
-  lastCheckDate: string
+}
+
+/** 加固件检查记录：每次检查一条，同一天补记多条时以后录的那条为准 */
+export interface SupportCheck {
+  id: string
+  /** 所属加固件 */
+  supportId: string
+  /** 冗余所属古树，便于按古树聚合与级联删除 */
+  treeId: string
+  /** 检查日期 YYYY-MM-DD */
+  date: string
+  /** 检查人 */
+  inspector: string
+  /** 检查结论 */
+  conclusion: string
+  createdAt: string
+  updatedAt: string
+  revision: number
+}
+
+/** 登记检查的表单草稿 */
+export interface SupportCheckDraft {
+  supportId: string
+  treeId: string
+  date: string
+  inspector: string
+  conclusion: string
 }
